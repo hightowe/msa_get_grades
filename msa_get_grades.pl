@@ -20,6 +20,7 @@ use Cwd 'abs_path';		# core
 use Data::Dumper;		# core
 use JSON::PP;			# core (if need faster, libjson-xs-perl)
 use URI;			# liburi-perl
+use URI::Escape;		# liburi-perl
 use LWP::UserAgent;		# libwww-perl
 use IO::Socket::SSL;		# libio-socket-ssl-perl
 use HTTP::Request::Common;	# libhttp-message-perl
@@ -56,8 +57,9 @@ if (1) {
   GET_LOOP: foreach my $kid (@kids) {
     my $kid_name = $kid->{name};
     $DATA->{$kid_name} = {};
+    $DATA->{$kid_name}->{kid} = $kid;
     my $userId = $kid->{userId};
-    my $markingPeriodId = $kid->{markingPeriodId};
+    my $markingPeriodId = $kid->{markingPeriodId} || '';
     my $durationList = 'to be set by code';
     my $schoolYearLabel = 'to be set by code';
 
@@ -115,23 +117,65 @@ if (1) {
           if ($dur->{DurationId} > 0 && $dur->{CurrentInd}) {
             $durationList = $dur->{DurationId};
             $DATA->{$kid_name}->{CurrentGroupTerm} = $dur;
-            #warn "For $kid_name, set durationList=$durationList\n";
+            #print "LHHD: for $kid_name, set durationList=$durationList\n";
             last StudentGroupTermList;
           }
         }
       }
     }
+
     # progress
     {
-      my $uri = URI->new($urlroot . '/api/datadirect/ParentStudentUserAcademicGroupsGet');
-      $uri->query_form(userId=>$userId,
-			schoolYearLabel=>$schoolYearLabel,
-			memberLevel=>3,
-			persona=>1,
-			durationList=>$durationList,
-			markingPeriodId=>$markingPeriodId,
-	);
-      $url = scalar($uri);
+      my $response = get_progress($userId,$schoolYearLabel,
+					$durationList,$markingPeriodId);
+      $DATA->{$kid_name}->{progress_json} = $response->decoded_content;
+      $DATA->{$kid_name}->{progress} = $json->decode($DATA->{$kid_name}->{progress_json});
+    }
+
+    # If needed, find most recent $markingPeriodId. This seems to be imperative
+    # only in times of transitions (like Xmas break, between Q2 and Q3), at
+    # which time no "current markingPeriodId" is set by get_kids_from_webapp_context().
+    # In those circumstances, we pull all marking periods for this kid (here) and
+    # choose the largest one (highest int). We then re-pull progress. Note that
+    # progress must be pulled first in order to collect the @LeadSectionList.
+    #
+    # After coding this, I wanted to add the markingPeriodDescription to the output,
+    # and that seems to only be retrievable by using this, and so, this code is now
+    # used every time (even when $markingPeriodId is pre-defined), but it only re-pulls
+    # the progress data when $markingPeriodId was not defined.
+    if (ref($DATA->{$kid_name}->{progress}) eq 'ARRAY') {
+      if (! length($markingPeriodId)) { $markingPeriodId = 0; }
+      my $markingPeriodIdStart = $markingPeriodId;
+
+      # Build the @LeadSectionList from the kid's retrieved progress
+      my $arrProg = $DATA->{$kid_name}->{progress};
+      my @LeadSectionList = ();
+      foreach my $class (@{$arrProg}) {
+        if (defined($class->{leadsectionid})) {
+          push @LeadSectionList, $class->{leadsectionid};
+        }
+      }
+      #warn "LHHD:\n" . Dumper(\@LeadSectionList) . "\n";
+
+      my %durationSectionList=();
+      $durationSectionList{DurationId} = $DATA->{$kid_name}->{CurrentGroupTerm}->{DurationId};
+
+      my @LeadSectionListDS=(); # An array of hashes data structure
+      foreach my $leadsectionid (@LeadSectionList) {
+        push @LeadSectionListDS, { LeadSectionId => $leadsectionid };
+      }
+      $durationSectionList{LeadSectionList} = \@LeadSectionListDS;
+      my @durationSectionList = (\%durationSectionList); # The data structure needed in the URL
+      # print Dumper(\@durationSectionList) . "\n";
+
+      # Pull the GradeBookMyDayMarkingPeriods data
+      my $uri_MPs=URI->new($urlroot.'/api/gradebook/GradeBookMyDayMarkingPeriods');
+      $uri_MPs->query_form(
+		durationSectionList => $json->encode(\@durationSectionList),
+		userId=>$userId,
+		personaID=>1,
+		);
+      $url = scalar($uri_MPs);
       #print $url . "\n";
       my $req = HTTP::Request::Common::GET($url);
       my $response = $ua->request($req);
@@ -139,9 +183,35 @@ if (1) {
         #print $response->as_string(); die;
         die("Failed on GET: $url\n");
       }
-      $DATA->{$kid_name}->{progress_json} = $response->decoded_content;
-      $DATA->{$kid_name}->{progress} = $json->decode($DATA->{$kid_name}->{progress_json});
+      my $arrMarkingPeriods = $json->decode($response->decoded_content);
+      #print "LHHD: " . Dumper($arrMarkingPeriods) . "\n";
+
+      # Note some case-flipping here (leading M to m)
+      MARKING_PERIODS: foreach my $mp (@{$arrMarkingPeriods}) {
+        # If we didn't enter this code with a valid markingPeriodId then choose the
+        # highest one in this list. If we did, add markingPeriodDescription to $kid
+        # for the markingPeriodId that we already knew.
+        if ($markingPeriodIdStart == 0 &&
+		defined($mp->{MarkingPeriodId}) && $mp->{MarkingPeriodId} > $markingPeriodId) {
+          $kid->{markingPeriodId} = $mp->{MarkingPeriodId};
+          $markingPeriodId = $kid->{markingPeriodId};
+          $kid->{markingPeriodDescription} = $mp->{MarkingPeriodDescription};
+        } elsif ($markingPeriodIdStart > 0 && $mp->{MarkingPeriodId} == $markingPeriodIdStart) {
+          $kid->{markingPeriodDescription} = $mp->{MarkingPeriodDescription};
+          last MARKING_PERIODS;
+        }
+      }
+
+      # If we started without it and now have a non-zero markingPeriodId, re-pull progress
+      if ($markingPeriodIdStart == 0 && $markingPeriodId) {
+        warn "Repulling progress for $kid_name due to having to determine the markingPeriodId\n";
+        my $response = get_progress($userId,$schoolYearLabel,
+					$durationList,$markingPeriodId);
+        $DATA->{$kid_name}->{progress_json} = $response->decoded_content;
+        $DATA->{$kid_name}->{progress} = $json->decode($DATA->{$kid_name}->{progress_json});
+      }
     }
+
   }
 }
 
@@ -152,10 +222,11 @@ KID_OUT: foreach my $kid_name (sort keys %{$DATA}) {
   my $schoollevel = $progress->[0]->{schoollevel};
   my $grade_level = int($DATA->{$kid_name}->{CurrentGradeLevel}->{GradeLevel});
   my $currentterm = $progress->[0]->{currentterm};
+  my $markingPeriodDescription = $DATA->{$kid_name}->{kid}->{markingPeriodDescription} || '??';
   my $schoolYear = $DATA->{$kid_name}->{CurrentGradeLevel}->{SchoolYearSession};
   $schoolYear =~ s/ //g; # Change "2020 - 2021" to "2020-2021"
 
-  print "$kid_name ($schoollevel Grade $grade_level, $schoolYear, $currentterm):\n";
+  print "$kid_name ($schoollevel Grade $grade_level, $schoolYear, $currentterm:$markingPeriodDescription):\n";
   foreach my $h (sort { $a->{cumgrade} <=> $b->{cumgrade} } @{$progress}) {
     printf ("  - %6.2f: %-35s %22s\n",
 	$h->{cumgrade}, $h->{sectionidentifier}, $h->{groupownername});
@@ -303,5 +374,31 @@ sub load_config() {
   }
 
   return \%conf;
+}
+
+
+sub get_progress() {
+  my $userId = shift @_;
+  my $schoolYearLabel = shift @_;
+  my $durationList = shift @_;
+  my $markingPeriodId = shift @_;
+
+  my $uri = URI->new($urlroot . '/api/datadirect/ParentStudentUserAcademicGroupsGet');
+  $uri->query_form(userId=>$userId,
+                   schoolYearLabel=>$schoolYearLabel,
+                   memberLevel=>3,
+                   persona=>1,
+                   durationList=>$durationList,
+                   markingPeriodId=>$markingPeriodId,
+   ); 
+  my $url = scalar($uri);
+  #print $url . "\n";
+  my $req = HTTP::Request::Common::GET($url);
+  my $response = $ua->request($req);
+  if (! $response->is_success) {
+    #print $response->as_string(); die;
+    die("Failed on GET: $url\n");
+  }
+  return $response;
 }
 
